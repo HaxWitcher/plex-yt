@@ -1,38 +1,38 @@
 import os
 import re
-import time
-import asyncio
 import yt_dlp
-from fastapi import FastAPI, Query, Request
+import asyncio
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
-# 📁 Hugging Face Persistent Storage
+# 📁 Direktoriјumi za Hugging Face Persistent Storage
 PERSISTENT_DIR = "/data"
 CACHE_DIR = os.path.join(PERSISTENT_DIR, ".cache")
-COOKIES_FILE = "cookies.json"
+COOKIES_FILE = "cookies.json"  # Ako koristiš cookie autentifikaciju
 
 # 🔧 Kreiraj potrebne direktorijume
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 
-# 🔁 ThreadPoolExecutor za paralelne zadatke
+# 🔁 Paralelno izvršavanje
 executor = ThreadPoolExecutor(max_workers=10)
-
 async def run_blocking(func, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
 
+# 🧼 Filtriraj naziv fajla
 def clean_filename(filename):
     return re.sub(r'[\\/*?:"<>|]', "", filename)
 
+# ✅ Test ruta
 @app.get("/")
 def root():
-    return {"message": "YouTube stream API radi 🚀"}
+    return {"message": "YouTube Stream API je aktivan 🚀"}
 
-# 🔍 Pretraga YouTube videa
+# 🔍 Pretraga YouTube
 @app.get("/search")
 async def search_video(q: str = Query(..., description="YouTube pretraga")):
     try:
@@ -58,7 +58,7 @@ async def search_video(q: str = Query(..., description="YouTube pretraga")):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# ▶️ Generiši direktan stream URL (bez preuzimanja)
+# ▶️ Direktni stream URL za 1080p video
 @app.get("/stream")
 async def stream_url_only(url: str):
     try:
@@ -66,7 +66,7 @@ async def stream_url_only(url: str):
             'quiet': True,
             'skip_download': True,
             'cookiefile': COOKIES_FILE,
-            'format': 'best[ext=mp4]/best',
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
             'cachedir': CACHE_DIR
         }
 
