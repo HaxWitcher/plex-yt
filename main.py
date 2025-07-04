@@ -43,7 +43,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
 
 # --- Concurrency control ---
-MAX_CONCURRENT_DOWNLOADS = 5
+MAX_CONCURRENT_DOWNLOADS = 30
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # --- Helpers ---
