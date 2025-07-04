@@ -1,32 +1,31 @@
-import os
-import io
-import math
-import base64
-import logging
+from fastapi import FastAPI, Request, Query, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
-import requests
-import subprocess
+import os
 import asyncio
 from datetime import datetime
 from urllib.parse import quote
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import subprocess
+import base64
+import requests
 
-from fastapi import FastAPI, Request, Query, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+SPOTIFY_CLIENT_ID = "spotify_client_id kalian "
+SPOTIFY_CLIENT_SECRET = "Spotify_client_secret kalian "
 
-# Configure logging
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_URL = "https://api.spotify.com/v1"
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
 app = FastAPI(
     title="YouTube dan Spotify Downloader API",
-    description="API untuk mengunduh video dan audio dari YouTube dan Spotify.",
-    version="2.1.0"
+    description="API untuk mengunduh video dan audio dari YouTube i Spotify.",
+    version="2.0.1"
 )
 
-# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,143 +34,127 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directories
 OUTPUT_DIR = "output"
 SPOTIFY_OUTPUT_DIR = "spotify_output"
-for d in (OUTPUT_DIR, SPOTIFY_OUTPUT_DIR):
-    os.makedirs(d, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
 
 COOKIES_FILE = "yt.txt"
 
-# ThreadPool for blocking operations
-executor = ThreadPoolExecutor(max_workers=8)
+# ---------- ograničenje simultanih download-a ----------
+MAX_CONCURRENT_DOWNLOADS = 5
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# Spotify credentials
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "your_spotify_client_id")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "your_spotify_client_secret")
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_API_URL = "https://api.spotify.com/v1"
-
-# Utility: Delete file after delay
 async def delete_file_after_delay(file_path: str, delay: int = 600):
     await asyncio.sleep(delay)
     try:
         os.remove(file_path)
-        logger.info(f"Deleted {file_path} after {delay}s")
+        logger.info(f"File {file_path} je izbrisan nakon {delay}s.")
+    except FileNotFoundError:
+        logger.warning(f"File {file_path} nije pronađen za brisanje.")
     except Exception as e:
-        logger.warning(f"Failed deleting {file_path}: {e}")
+        logger.error(f"Greška prilikom brisanja {file_path}: {e}")
 
-# Utility: Spotify token
 def get_spotify_access_token():
     auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
     b64_auth = base64.b64encode(auth_str.encode()).decode()
-    resp = requests.post(
-        SPOTIFY_TOKEN_URL,
-        headers={"Authorization": f"Basic {b64_auth}"},
-        data={"grant_type": "client_credentials"}
-    )
+    headers = {"Authorization": f"Basic {b64_auth}"}
+    data = {"grant_type": "client_credentials"}
+    resp = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
     if resp.status_code != 200:
-        raise Exception(f"Spotify token error: {resp.text}")
+        raise Exception(f"Token error: {resp.text}")
     return resp.json()["access_token"]
 
-# Log all requests
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    start = datetime.utcnow()
+    start = datetime.now()
     response = await call_next(request)
-    latency = (datetime.utcnow() - start).total_seconds() * 1000
-    logger.info(f"{request.client.host} {request.method} {request.url} -> {response.status_code} ({latency:.1f}ms)")
+    ms = (datetime.now() - start).microseconds / 1000
+    logger.info(f"{request.client.host} {request.method} {request.url} -> {response.status_code} [{ms:.2f}ms]")
     return response
 
-@app.get("/", summary="Root Endpoint")
+@app.get("/", summary="Root")
 async def root():
-    return {"message": "API is running"}
+    path = "/app/Apiytdlp/index.html"
+    return FileResponse(path) if os.path.exists(path) else JSONResponse(status_code=404, content={"error":"index.html not found"})
 
-# ------ YouTube endpoints ------
+# ... SEARCH i INFO endpointi ostaju nepromijenjeni ...
 
-@app.get("/download/", summary="Unduhan Video YouTube")
+@app.get("/download/", summary="Preuzmi video")
 async def download_video(
+    background_tasks: BackgroundTasks,
     url: str = Query(...),
-    resolution: int = Query(720),
-    background_tasks: BackgroundTasks = None
+    resolution: int = Query(720)
 ):
-    """
-    Download video and stream from local file with efficient handling.
-    """
-    # Blocking download in thread pool
-    def _dl():
-        opts = {
-            'format': f'bestvideo[height<={resolution}]+bestaudio',
+    await download_semaphore.acquire()
+    try:
+        ydl_opts = {
+            'format': f'bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_%(resolution)sp.%(ext)s'),
             'cookiefile': COOKIES_FILE,
             'merge_output_format': 'mp4'
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
-    file_path = await asyncio.get_event_loop().run_in_executor(executor, _dl)
+            file_path = ydl.prepare_filename(info)
 
-    if not os.path.exists(file_path):
-        return JSONResponse(status_code=500, content={"error": "Download failed"})
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Nije pronađen: {file_path}")
 
-    # Schedule deletion
-    background_tasks.add_task(delete_file_after_delay, file_path)
+        background_tasks.add_task(delete_file_after_delay, file_path)
+        # FileResponse služi streaming fajla u chunkovima i podržava Range headers
+        return FileResponse(file_path, media_type="video/mp4", filename=os.path.basename(file_path))
+    except Exception as e:
+        logger.error(f"download_video error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
 
-    # Stream file efficiently
-    return FileResponse(
-        path=file_path,
-        media_type='video/mp4',
-        filename=os.path.basename(file_path)
-    )
-
-@app.get("/download/audio/", summary="Unduhan Audio YouTube")
+@app.get("/download/audio/", summary="Preuzmi audio")
 async def download_audio(
+    background_tasks: BackgroundTasks,
     url: str = Query(...),
-    background_tasks: BackgroundTasks = None
 ):
-    def _dl_audio():
-        opts = {
+    await download_semaphore.acquire()
+    try:
+        ydl_opts = {
+            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_audio.mp3'),
             'format': 'bestaudio/best',
-            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s.%(ext)s'),
             'cookiefile': COOKIES_FILE,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '128',
-            }]
+            }],
+            'prefer_ffmpeg': True,
+            'quiet': True,
+            'no_warnings': True
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return f"{info['title']}.mp3"
 
-    filename = await asyncio.get_event_loop().run_in_executor(executor, _dl_audio)
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    if not os.path.exists(file_path):
-        return JSONResponse(status_code=500, content={"error": "Audio download failed"})
-    background_tasks.add_task(delete_file_after_delay, file_path)
-    return FileResponse(path=file_path, media_type='audio/mpeg', filename=filename)
+        filename = f"{info['title']}_audio.mp3"
+        file_path = os.path.join(OUTPUT_DIR, filename)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Nije pronađen: {file_path}")
 
-# ------ Spotify endpoints (unchanged) ------
-@app.get("/spotify/search", summary="Cari lagu di Spotify")
-async def spotify_search(query: str = Query(...)):
-    try:
-        token = get_spotify_access_token()
-        resp = requests.get(
-            f"{SPOTIFY_API_URL}/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"q": query, "type": "track", "limit": 5}
-        )
-        data = resp.json()
-        results = []
-        for track in data.get('tracks', {}).get('items', []):
-            results.append({
-                'title': track['name'],
-                'artist': ', '.join(a['name'] for a in track['artists']),
-                'spotify_url': track['external_urls']['spotify']
-            })
-        return {"results": results}
+        background_tasks.add_task(delete_file_after_delay, file_path)
+        return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
     except Exception as e:
-        logger.error(f"Spotify search error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"download_audio error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
 
-# ... other Spotify endpoints remain the same ...
+# ... download_with_subtitle, download_playlist i Spotify endpointi stavite ispod,
+# po istom principu: oko svakog dugotrajnog yt_dlp/ffmpeg poziva staviti:
+#   await download_semaphore.acquire()
+#   try: ... finally: download_semaphore.release()
+# i za isporuku lokalnih fajlova koristiti FileResponse umjesto čitanja u memoriju.
+
+@app.get("/download/file/{filename}", summary="Poslužuje fajl")
+async def serve_file(filename: str):
+    path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={"error": "File nije pronađen"})
+    return FileResponse(path, filename=filename)
