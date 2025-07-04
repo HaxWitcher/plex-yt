@@ -8,69 +8,39 @@ from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
-# 📁 Direktoriјumi za Hugging Face Persistent Storage
+# 📁 Putanja ka cache folderu (Hugging Face storage)
 PERSISTENT_DIR = "/data"
 CACHE_DIR = os.path.join(PERSISTENT_DIR, ".cache")
-COOKIES_FILE = "cookies.json"  # Ako koristiš cookie autentifikaciju
+COOKIES_FILE = "cookies.json"
 
-# 🔧 Kreiraj potrebne direktorijume
+# Kreiranje cache foldera i podešavanje environment varijable
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 
-# 🔁 Paralelno izvršavanje
+# 🔁 ThreadPool za async rad
 executor = ThreadPoolExecutor(max_workers=10)
+
 async def run_blocking(func, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
 
-# 🧼 Filtriraj naziv fajla
-def clean_filename(filename):
-    return re.sub(r'[\\/*?:"<>|]', "", filename)
-
-# ✅ Test ruta
 @app.get("/")
-def root():
+def index():
     return {"message": "YouTube Stream API je aktivan 🚀"}
 
-# 🔍 Pretraga YouTube
-@app.get("/search")
-async def search_video(q: str = Query(..., description="YouTube pretraga")):
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'cookiefile': COOKIES_FILE,
-            'cachedir': CACHE_DIR
-        }
-
-        def _search():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(f"ytsearch10:{q}", download=False)['entries']
-
-        results = await run_blocking(_search)
-
-        return [{
-            "title": video["title"],
-            "url": video["webpage_url"],
-            "duration": video["duration"],
-            "thumbnail": video["thumbnail"]
-        } for video in results]
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# ▶️ Direktni stream URL za 1080p video
+# ▶️ Direktan stream URL sa YouTube-a (max 1080p)
 @app.get("/stream")
-async def stream_url_only(url: str):
+async def stream_url_only(url: str = Query(..., description="YouTube video URL")):
     try:
         ydl_opts = {
             'quiet': True,
             'skip_download': True,
             'cookiefile': COOKIES_FILE,
-            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
-            'cachedir': CACHE_DIR
+            'cachedir': CACHE_DIR,
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
         }
 
-        def _extract_url():
+        def _extract():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 return {
@@ -81,34 +51,8 @@ async def stream_url_only(url: str):
                     "thumbnail": info.get("thumbnail")
                 }
 
-        result = await run_blocking(_extract_url)
+        result = await run_blocking(_extract)
         return result
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# ℹ️ Info o videu
-@app.get("/info/")
-async def get_info(url: str):
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'cookiefile': COOKIES_FILE,
-            'cachedir': CACHE_DIR
-        }
-
-        def _info():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        info = await run_blocking(_info)
-        return {
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "webpage_url": info.get("webpage_url"),
-            "thumbnail": info.get("thumbnail"),
-            "description": info.get("description")
-        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
