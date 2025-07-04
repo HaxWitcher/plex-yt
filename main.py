@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
-# 📁 Postavke trajnog direktorijuma (Persistent Storage)
+# 📁 Putanje za Hugging Face Persistent Storage
 PERSISTENT_DIR = "/data"
 OUTPUT_DIR = os.path.join(PERSISTENT_DIR, "output")
 SPOTIFY_OUTPUT_DIR = os.path.join(PERSISTENT_DIR, "spotify")
 CACHE_DIR = os.path.join(PERSISTENT_DIR, ".cache")
 COOKIES_FILE = "cookies.json"
 
-# ✅ Kreiraj potrebne direktorijume
+# ✅ Kreiraj direktorijume ako ne postoje
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -25,7 +25,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # ✅ Postavi cache path za yt-dlp
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 
-# ✅ Konkurentni izvršivač za yt-dlp (do 10 paralelnih procesa)
+# ✅ ThreadPoolExecutor za paralelne yt-dlp zadatke
 executor = ThreadPoolExecutor(max_workers=10)
 
 async def run_blocking(func, *args, **kwargs):
@@ -45,7 +45,7 @@ def clean_old_files(directory, max_age_minutes=120):
                 try:
                     os.remove(file_path)
                 except Exception:
-                    pass  # Ignoriši greške pri brisanju
+                    pass
 
 @app.get("/")
 def read_root():
@@ -186,7 +186,3 @@ async def get_info(url: str):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=7860)
