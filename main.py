@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Query, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import os
@@ -56,6 +56,9 @@ async def delete_file_after_delay(file_path: str, delay: int = 600):
         logger.warning(f"Could not delete {file_path}: {e}")
 
 def load_cookies_header() -> str:
+    """
+    Parsira Netscape cookies iz yt.txt i vraća ih kao 'name1=val1; name2=val2; ...'
+    """
     cookies = []
     with open(COOKIES_FILE, 'r') as f:
         for line in f:
@@ -114,64 +117,53 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
     finally:
         download_semaphore.release()
 
-# --- Streaming endpoint (HLS / progressive / ffmpeg mux) ---
+# --- Streaming endpoint (fragmentirani MP4 u 1080p) ---
 @app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Izvuci sve tokove koristeći cookiefile
-        ydl_opts = { 'quiet': True, 'cookiefile': COOKIES_FILE }
+        # 1) Izvuci sve tokove s yt-dlp koristeći samo cookiefile:
+        ydl_opts = {
+            'quiet': True,
+            'cookiefile': COOKIES_FILE,
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pokušaj HLS manifest (ext=m3u8)
-        hls = next((f for f in info['formats']
-                    if f.get('ext') in ('m3u8',) or f.get('protocol','').startswith('m3u8')), None)
-        if hls and hls.get('height') == resolution:
-            return RedirectResponse(hls['url'])
+        # 2) Pronađi EXPLICITNO video-only tok 1080p mp4
+        vid_fmt = next(
+            f for f in info['formats']
+            if f.get('vcodec') != 'none'
+               and f.get('height') == resolution
+               and f.get('ext') == 'mp4'
+        )
 
-        # 3) Pokušaj progresivni MP4 (video+audio u jednom)
-        prog = next((f for f in info['formats']
-                     if f.get('vcodec')!='none' and f.get('acodec')!='none'
-                        and f.get('height')==resolution and f.get('ext')=='mp4'),
-                    None)
-        if prog:
-            return RedirectResponse(prog['url'])
+        # 3) Pronađi najbolji audio-only tok
+        aud_fmt = max(
+            (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
+            key=lambda x: x.get('abr', 0)
+        )
 
-        # 4) Fallback: fragmentirani ffmpeg mux
-        vid_fmt = next(f for f in info['formats']
-                       if f.get('vcodec')!='none' and f.get('height')==resolution and f.get('ext')=='mp4')
-        aud_fmt = max((f for f in info['formats']
-                       if f.get('vcodec')=='none' and f.get('acodec')!='none'),
-                      key=lambda x: x.get('abr', 0))
-        vid_url, aud_url = vid_fmt['url'], aud_fmt['url']
+        vid_url = vid_fmt['url']
+        aud_url = aud_fmt['url']
 
+        # 4) S istim cookies za ffmpeg:
         cookie_header = load_cookies_header()
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
 
-        def stream_gen():
-            yield b''  # da klijent odmah primi nešto
-            cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'error',
-                *headers_arg, '-i', vid_url,
-                *headers_arg, '-i', aud_url,
-                '-c:v', 'copy', '-c:a', 'copy',
-                '-movflags', 'frag_keyframe+empty_moov',
-                '-f', 'mp4', 'pipe:1'
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
-            try:
-                while True:
-                    chunk = proc.stdout.read(64*1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                proc.kill()
-
-        return StreamingResponse(stream_gen(), media_type="video/mp4")
+        # 5) Fragmentirani MP4 streaming
+        cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            *headers_arg, '-i', vid_url,
+            *headers_arg, '-i', aud_url,
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-movflags', 'frag_keyframe+empty_moov',
+            '-f', 'mp4', 'pipe:1'
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
+        return StreamingResponse(proc.stdout, media_type="video/mp4")
 
     except StopIteration:
-        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p toka.")
+        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
     except Exception as e:
         logger.error(f"stream_video error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -185,8 +177,10 @@ async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...
             'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_audio.mp3'),
             'format': 'bestaudio/best',
             'cookiefile': COOKIES_FILE,
-            'postprocessors': [{'key':'FFmpegExtractAudio','preferredcodec':'mp3','preferredquality':'128'}],
-            'prefer_ffmpeg': True, 'quiet': True, 'no_warnings': True
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
+            'prefer_ffmpeg': True,
+            'quiet': True,
+            'no_warnings': True
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -202,7 +196,7 @@ async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...
     finally:
         download_semaphore.release()
 
-# --- Serve lokalni fajl ---
+# --- Serve downloaded file ---
 @app.get("/download/file/{filename}", summary="Poslužuje fajl")
 async def serve_file(filename: str):
     path = os.path.join(OUTPUT_DIR, filename)
