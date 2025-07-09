@@ -55,19 +55,9 @@ async def delete_file_after_delay(file_path: str, delay: int = 600):
     except Exception as e:
         logger.warning(f"Could not delete {file_path}: {e}")
 
-def get_spotify_access_token():
-    auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
-    headers = {"Authorization": f"Basic {b64_auth}"}
-    data = {"grant_type": "client_credentials"}
-    resp = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
-    if resp.status_code != 200:
-        raise Exception(f"Token error: {resp.text}")
-    return resp.json()["access_token"]
-
 def load_cookies_header() -> str:
     """
-    Parsira Netscape cookies iz yt.txt i vraća ih kao 'name1=val1; name2=val2; ...'
+    Parsira Netscape cookies iz yt.txt i vraća ih kao "name1=val1; name2=val2; …".
     """
     cookies = []
     with open(COOKIES_FILE, 'r') as f:
@@ -79,6 +69,16 @@ def load_cookies_header() -> str:
                 name, value = parts[5], parts[6]
                 cookies.append(f"{name}={value}")
     return '; '.join(cookies)
+
+def get_spotify_access_token():
+    auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    headers = {"Authorization": f"Basic {b64_auth}"}
+    data = {"grant_type": "client_credentials"}
+    resp = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
+    if resp.status_code != 200:
+        raise Exception(f"Token error: {resp.text}")
+    return resp.json()["access_token"]
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -117,23 +117,24 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
     finally:
         download_semaphore.release()
 
-# --- Streaming endpoint (fragmentirani MP4 u 1080p) ---
+# --- Streaming endpoint (fragmentirani MP4 točno u 1080p) ---
 @app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Pripremi cookies header
-        cookie_header = load_cookies_header()
-
-        # 2) Izvuci sve formate uz pomoć yt-dlp i cookies
+        # 1) Učitaj browser-like User-Agent i cookies za yt-dlp:
         ydl_opts = {
             'quiet': True,
             'cookiefile': COOKIES_FILE,
-            'http_headers': {'Cookie': cookie_header},
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 (KHTML, like Gecko) '
+                              'Chrome/115.0 Safari/537.36'
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 3) Pronađi točno željeni video-only tok (1080p mp4)
+        # 2) Pronađi EXPLICITNO video-only tok od 1080p mp4
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none'
@@ -141,17 +142,21 @@ async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
                and f.get('ext') == 'mp4'
         )
 
-        # 4) Pronađi najbolji audio-only tok
+        # 3) Pronađi najboljeg audio-only toka
         aud_fmt = max(
-            (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
+            (f for f in info['formats']
+             if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
         vid_url = vid_fmt['url']
         aud_url = aud_fmt['url']
 
-        # 5) Pokreni ffmpeg za fragmentirani MP4 streaming, uz proslijeđivanje istih cookies
+        # 4) Pripremi Cookie header za ffmpeg
+        cookie_header = load_cookies_header()
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
+
+        # 5) Pokreni ffmpeg za fragmentirani MP4 streaming
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             *headers_arg, '-i', vid_url,
@@ -178,7 +183,7 @@ async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...
             'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_audio.mp3'),
             'format': 'bestaudio/best',
             'cookiefile': COOKIES_FILE,
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'}],
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
             'prefer_ffmpeg': True,
             'quiet': True,
             'no_warnings': True
@@ -194,6 +199,8 @@ async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...
     except Exception as e:
         logger.error(f"download_audio error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
 
 # --- Serve downloaded file ---
 @app.get("/download/file/{filename}", summary="Poslužuje fajl")
