@@ -121,47 +121,43 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
 @app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Izvuci sve tokove s yt-dlp koristeći samo cookiefile:
-        ydl_opts = {
-            'quiet': True,
-            'cookiefile': COOKIES_FILE,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        # 2) Pronađi EXPLICITNO video-only tok 1080p mp4
-        vid_fmt = next(
-            f for f in info['formats']
-            if f.get('vcodec') != 'none'
-               and f.get('height') == resolution
-               and f.get('ext') == 'mp4'
-        )
-
-        # 3) Pronađi najbolji audio-only tok
-        aud_fmt = max(
-            (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
-            key=lambda x: x.get('abr', 0)
-        )
-
-        vid_url = vid_fmt['url']
-        aud_url = aud_fmt['url']
-
-        # 4) S istim cookies za ffmpeg:
+        # 1) pripremi Cookie header
         cookie_header = load_cookies_header()
-        headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
 
-        # 5) Fragmentirani MP4 streaming
+        # 2) koristimo yt-dlp CLI za dobivanje video i audio URL-a brzo
         cmd = [
+            "yt-dlp", "--cookies", COOKIES_FILE,
+            "-f", f"bestvideo[height={resolution}][ext=mp4]+bestaudio/best",
+            "-g", url
+        ]
+        proc_urls = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=4
+        )
+        if proc_urls.returncode != 0:
+            raise HTTPException(status_code=500, detail="Greška pri dohvaćanju direktnih URL-ova")
+        lines = [l for l in proc_urls.stdout.splitlines() if l.strip()]
+        if len(lines) < 2:
+            raise HTTPException(status_code=500, detail="Nije moguće dohvatiti video/audio URL")
+        video_url, audio_url = lines[0], lines[1]
+
+        # 3) spawn-amo ffmpeg za fragmentirani mp4 sa istim cookies
+        headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
+        ffmpeg_cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
-            *headers_arg, '-i', vid_url,
-            *headers_arg, '-i', aud_url,
+            *headers_arg, '-i', video_url,
+            *headers_arg, '-i', audio_url,
             '-c:v', 'copy', '-c:a', 'copy',
             '-movflags', 'frag_keyframe+empty_moov',
             '-f', 'mp4', 'pipe:1'
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
-        return StreamingResponse(proc.stdout, media_type="video/mp4")
+        proc_stream = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE)
+        return StreamingResponse(proc_stream.stdout, media_type="video/mp4")
 
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Timeout pri dohvaćanju URL-ova za stream")
     except StopIteration:
         raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
     except Exception as e:
