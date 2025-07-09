@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import os
 import asyncio
+from asyncio.subprocess import PIPE
 from datetime import datetime
 from urllib.parse import quote
 import logging
@@ -117,56 +118,59 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
     finally:
         download_semaphore.release()
 
-# --- Streaming endpoint (fragmentirani MP4 u 1080p) ---
+# --- Streaming endpoint with keep-alive chunks ---
 @app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
-    try:
-        # 1) Izvuci sve tokove s yt-dlp koristeći samo cookiefile:
-        ydl_opts = {
-            'quiet': True,
-            'cookiefile': COOKIES_FILE,
-        }
+    # Učitaj COOKIE header za ffmpeg
+    cookie_header = load_cookies_header()
+    loop = asyncio.get_event_loop()
+
+    # Blocking extraction u threadpool-u
+    def extract():
+        ydl_opts = {'quiet': True, 'cookiefile': COOKIES_FILE}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
-        # 2) Pronađi EXPLICITNO video-only tok 1080p mp4
-        vid_fmt = next(
+        vid = next(
             f for f in info['formats']
-            if f.get('vcodec') != 'none'
-               and f.get('height') == resolution
-               and f.get('ext') == 'mp4'
+            if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-
-        # 3) Pronađi najbolji audio-only tok
-        aud_fmt = max(
+        aud = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
+        return vid['url'], aud['url']
 
-        vid_url = vid_fmt['url']
-        aud_url = aud_fmt['url']
+    info_future = loop.run_in_executor(None, extract)
 
-        # 4) S istim cookies za ffmpeg:
-        cookie_header = load_cookies_header()
+    async def stream_generator():
+        # Keep-alive: šalji prazne bajtove dok se ne završi extract (>5s)
+        while not info_future.done():
+            yield b'\n'
+            await asyncio.sleep(1)
+        try:
+            vid_url, aud_url = info_future.result()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # pokreni ffmpeg s istim cookies
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
-
-        # 5) Fragmentirani MP4 streaming
-        cmd = [
+        proc = await asyncio.create_subprocess_exec(
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             *headers_arg, '-i', vid_url,
             *headers_arg, '-i', aud_url,
             '-c:v', 'copy', '-c:a', 'copy',
             '-movflags', 'frag_keyframe+empty_moov',
-            '-f', 'mp4', 'pipe:1'
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
-        return StreamingResponse(proc.stdout, media_type="video/mp4")
+            '-f', 'mp4', 'pipe:1',
+            stdout=PIPE
+        )
+        # stream iz ffmpeg-a
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            yield chunk
 
-    except StopIteration:
-        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
-    except Exception as e:
-        logger.error(f"stream_video error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return StreamingResponse(stream_generator(), media_type="video/mp4")
 
 # --- Download audio ---
 @app.get("/download/audio/", summary="Preuzmi audio")
