@@ -1,30 +1,42 @@
 # syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 
-# Install git dan dependensi dasar
-RUN apt-get update && apt-get install -y git && apt-get install ffmpeg -y && apt-get clean
+# 1) Instaliraj sistemske alate i ffmpeg
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git \
+      ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-# Set working directory ke /root
+# 2) Postavi da Python ne buffer-uje izlaz (logovi odmah u logovima Railway)
+ENV PYTHONUNBUFFERED=1
+
+# 3) Radni direktorij
 WORKDIR /app
 
-# Clone repository
-RUN git clone https://github.com/HaxWitcher/plex-yt.git
-
-# Masuk ke direktori project
+# 4) Kloniraj repo i pripremi folder-e
+RUN git clone https://github.com/HaxWitcher/plex-yt.git /app/plex-yt
 WORKDIR /app/plex-yt
 
-# Buat folder output dengan permission penuh
-RUN mkdir -p output spotify_output && chmod -R 777 output spotify_output
+RUN mkdir -p output spotify_output \
+ && chmod -R 777 output spotify_output \
+ && chmod 777 yt.txt
 
-# Hapus dan tulis ulang file yt.txt
+# 5) Instaliraj Python zavisnosti
+#    - requests za Spotify
+#    - uvicorn[standard] da uključimo websockets i access-log podršku
+#    - fastapi, yt-dlp iz requirements.txt
+RUN pip install --no-cache-dir \
+      requests \
+      "uvicorn[standard]" \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Install dependencies Python
-RUN pip install requests
-RUN pip install -r requirements.txt
-RUN chmod 777 yt.txt
-
-# Expose port untuk FastAPI
+# 6) Expose port FastAPI
 EXPOSE 7860
 
-# Jalankan FastAPI dengan Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# 7) CMD s uključenim debug i access-log
+CMD ["uvicorn", "main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "7860", \
+     "--log-level", "debug", \
+     "--access-log"]
