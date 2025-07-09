@@ -32,3 +32,4 @@ EXPOSE 7860
 
 # 8) start na portu koji Railway zadaje u env VAR PORT
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860} --log-level debug --access-log"]
+
