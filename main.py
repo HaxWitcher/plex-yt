@@ -1,38 +1,31 @@
+from fastapi import FastAPI, Request, Query, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import yt_dlp
 import os
 import asyncio
+from datetime import datetime
+from urllib.parse import quote
 import logging
 import subprocess
 import base64
-from datetime import datetime
-from urllib.parse import quote
-
 import requests
-import yt_dlp
-from fastapi import (
-    FastAPI, Request, Query, BackgroundTasks,
-    HTTPException
-)
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 
-# --- Spotify credentials (ako koristiš Spotify API) ---
-SPOTIFY_CLIENT_ID = "spotify_client_id_kalian"
-SPOTIFY_CLIENT_SECRET = "spotify_client_secret_kalian"
+# --- Spotify credentials ---
+SPOTIFY_CLIENT_ID = "spotify_client_id kalian "
+SPOTIFY_CLIENT_SECRET = "Spotify_client_secret kalian "
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_URL = "https://api.spotify.com/v1"
 
 # --- Logging setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- FastAPI app ---
 app = FastAPI(
-    title="YouTube i Spotify Downloader API",
-    description="API za download i streaming video/audio s YouTube-a i Spotify-a",
-    version="2.0.3"
+    title="YouTube dan Spotify Downloader API",
+    description="API untuk mengunduh atau stream video/audio dari YouTube dan Spotify.",
+    version="2.0.2"
 )
 app.add_middleware(
     CORSMiddleware,
@@ -42,27 +35,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Paths i direktoriji ---
-BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
-COOKIES_FILE       = os.path.join(BASE_DIR, "yt.txt")
-OUTPUT_DIR         = os.path.join(BASE_DIR, "output")
-SPOTIFY_OUTPUT_DIR = os.path.join(BASE_DIR, "spotify_output")
-
+# --- Directories and files ---
+OUTPUT_DIR = "output"
+SPOTIFY_OUTPUT_DIR = "spotify_output"
+COOKIES_FILE = "yt.txt"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
 
-# --- Ograničenje paralelnih download-a ---
+# --- Concurrency control ---
 MAX_CONCURRENT_DOWNLOADS = 30
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# --- Pomoćne funkcije ---
+# --- Helpers ---
 async def delete_file_after_delay(file_path: str, delay: int = 600):
     await asyncio.sleep(delay)
     try:
         os.remove(file_path)
-        logger.info(f"File {file_path} izbrisan nakon {delay}s.")
+        logger.info(f"File {file_path} deleted after {delay}s.")
     except Exception as e:
-        logger.warning(f"Ne mogu izbrisati {file_path}: {e}")
+        logger.warning(f"Could not delete {file_path}: {e}")
 
 def get_spotify_access_token():
     auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
@@ -71,10 +62,24 @@ def get_spotify_access_token():
     data = {"grant_type": "client_credentials"}
     resp = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
     if resp.status_code != 200:
-        raise Exception(f"Greška pri dobivanju tokena: {resp.text}")
+        raise Exception(f"Token error: {resp.text}")
     return resp.json()["access_token"]
 
-# --- Middleware za logiranje svakog requesta ---
+def load_cookies_header() -> str:
+    """
+    Parsira Netscape cookies iz yt.txt i vraća ih kao 'name1=val1; name2=val2; ...'
+    """
+    cookies = []
+    with open(COOKIES_FILE, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) >= 7:
+                name, value = parts[5], parts[6]
+                cookies.append(f"{name}={value}")
+    return '; '.join(cookies)
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = datetime.now()
@@ -83,136 +88,115 @@ async def log_requests(request: Request, call_next):
     logger.info(f"{request.client.host} {request.method} {request.url} -> {response.status_code} [{ms:.1f}ms]")
     return response
 
-# --- Root endpoint ---
-@app.get("/", summary="Root", description="Provjera servisa")
+@app.get("/", summary="Root")
 async def root():
-    return JSONResponse({"status": "OK", "version": app.version})
+    index = "/app/Apiytdlp/index.html"
+    return FileResponse(index) if os.path.exists(index) else JSONResponse(status_code=404, content={"error": "index.html not found"})
 
-# --- Download video u file ---
-@app.get("/download/", summary="Preuzmi video", description="Preuzmi cijeli video i vrati ga kao MP4")
-async def download_video(
-    background_tasks: BackgroundTasks,
-    url: str = Query(..., description="YouTube URL"),
-    resolution: int = Query(720, description="Rezolucija (npr. 720, 1080)")
-):
+# --- Download video to file ---
+@app.get("/download/", summary="Preuzmi video")
+async def download_video(background_tasks: BackgroundTasks, url: str = Query(...), resolution: int = Query(720)):
     await download_semaphore.acquire()
     try:
         ydl_opts = {
-            "format": f"bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-            "outtmpl": os.path.join(OUTPUT_DIR, "%(title)s_%(resolution)sp.%(ext)s"),
-            "cookiefile": COOKIES_FILE,
-            "merge_output_format": "mp4"
+            'format': f'bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_%(resolution)sp.%(ext)s'),
+            'cookiefile': COOKIES_FILE,
+            'merge_output_format': 'mp4'
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             path = ydl.prepare_filename(info)
-
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-
         background_tasks.add_task(delete_file_after_delay, path)
         return FileResponse(path, media_type="video/mp4", filename=os.path.basename(path))
-
     except Exception as e:
         logger.error(f"download_video error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         download_semaphore.release()
 
-# --- Streaming endpoint (fragmentirani MP4 u odabranoj rezoluciji) ---
-@app.get("/stream/", summary="Streamuj video", description="Fragmentirani MP4 stream točno u odabranoj rezoluciji")
-async def stream_video(
-    url: str = Query(..., description="YouTube URL"),
-    resolution: int = Query(1080, description="Točno height==resolution")
-):
+# --- Streaming endpoint (fragmentirani MP4 u 1080p) ---
+@app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
+async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Dobavi sve formate koristeći cookies
+        # 1) Pripremi cookies header
+        cookie_header = load_cookies_header()
+
+        # 2) Izvuci sve formate uz pomoć yt-dlp i cookies
         ydl_opts = {
-            "quiet": True,
-            "cookiefile": COOKIES_FILE,
+            'quiet': True,
+            'cookiefile': COOKIES_FILE,
+            'http_headers': {'Cookie': cookie_header},
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pronađi točno željeni video-only tok (1080p mp4)
+        # 3) Pronađi točno željeni video-only tok (1080p mp4)
         vid_fmt = next(
-            f for f in info["formats"]
-            if f.get("vcodec") != "none"
-               and f.get("height") == resolution
-               and f.get("ext") == "mp4"
+            f for f in info['formats']
+            if f.get('vcodec') != 'none'
+               and f.get('height') == resolution
+               and f.get('ext') == 'mp4'
         )
 
-        # 3) Pronađi najbolji audio-only tok
+        # 4) Pronađi najbolji audio-only tok
         aud_fmt = max(
-            (f for f in info["formats"] if f.get("vcodec") == "none" and f.get("acodec") != "none"),
-            key=lambda x: x.get("abr", 0)
+            (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
+            key=lambda x: x.get('abr', 0)
         )
 
-        vid_url = vid_fmt["url"]
-        aud_url = aud_fmt["url"]
+        vid_url = vid_fmt['url']
+        aud_url = aud_fmt['url']
 
-        # 4) Pokreni ffmpeg za fragmentirani MP4 streaming
+        # 5) Pokreni ffmpeg za fragmentirani MP4 streaming, uz proslijeđivanje istih cookies
+        headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", vid_url, "-i", aud_url,
-            "-c:v", "copy", "-c:a", "copy",
-            "-movflags", "frag_keyframe+empty_moov",
-            "-f", "mp4", "pipe:1"
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            *headers_arg, '-i', vid_url,
+            *headers_arg, '-i', aud_url,
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-movflags', 'frag_keyframe+empty_moov',
+            '-f', 'mp4', 'pipe:1'
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
         return StreamingResponse(proc.stdout, media_type="video/mp4")
 
     except StopIteration:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Nema dostupnog {resolution}p video toka."
-        )
+        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
     except Exception as e:
         logger.error(f"stream_video error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Download audio u mp3 ---
-@app.get("/download/audio/", summary="Preuzmi audio", description="Preuzmi samo audio i vrati MP3")
-async def download_audio(
-    background_tasks: BackgroundTasks,
-    url: str = Query(..., description="YouTube URL")
-):
+# --- Download audio ---
+@app.get("/download/audio/", summary="Preuzmi audio")
+async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...)):
     await download_semaphore.acquire()
     try:
         ydl_opts = {
-            "outtmpl": os.path.join(OUTPUT_DIR, "%(title)s_audio.mp3"),
-            "format": "bestaudio/best",
-            "cookiefile": COOKIES_FILE,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "128"
-                }
-            ],
-            "prefer_ffmpeg": True,
-            "quiet": True,
-            "no_warnings": True
+            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_audio.mp3'),
+            'format': 'bestaudio/best',
+            'cookiefile': COOKIES_FILE,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'}],
+            'prefer_ffmpeg': True,
+            'quiet': True,
+            'no_warnings': True
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-
         fname = f"{info['title']}_audio.mp3"
         path = os.path.join(OUTPUT_DIR, fname)
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-
         background_tasks.add_task(delete_file_after_delay, path)
         return FileResponse(path, media_type="audio/mpeg", filename=fname)
-
     except Exception as e:
         logger.error(f"download_audio error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        download_semaphore.release()
 
-# --- Serve lokalni fajl ---
-@app.get("/download/file/{filename}", summary="Poslužuje fajl", description="Vraća već preuzeti fajl")
+# --- Serve downloaded file ---
+@app.get("/download/file/{filename}", summary="Poslužuje fajl")
 async def serve_file(filename: str):
     path = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(path):
