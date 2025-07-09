@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.4
+FROM python:3.11-slim
+
+# Install git dan dependensi dasar
+RUN apt-get update && apt-get install -y git && apt-get install ffmpeg -y && apt-get clean
+
+# Set working directory ke /root
+WORKDIR /app
+
+# Clone repository
+RUN git clone https://github.com/HaxWitcher/plex-yt.git
+
+# Masuk ke direktori project
+WORKDIR /app/plex-yt
+
+# Buat folder output dengan permission penuh
+RUN mkdir -p output spotify_output && chmod -R 777 output spotify_output
+
+# Hapus dan tulis ulang file yt.txt
+
+# Install dependencies Python
+RUN pip install requests
+RUN pip install -r requirements.txt
+RUN chmod 777 yt.txt
+
+# Expose port untuk FastAPI
+EXPOSE 7860
+
+# Jalankan FastAPI dengan Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
