@@ -1,36 +1,26 @@
 # syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 
-# 1) sistema paketi
+# — instaliraj OS pakete
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      git \
-      ffmpeg \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y git ffmpeg \
+ && apt-get clean
 
-# 2) da Python ne buffer-uje logove
-ENV PYTHONUNBUFFERED=1
+WORKDIR /app
 
-# 3) radni direktorij
-WORKDIR /app/plex-yt
+# — kopiraj sav kod (ili clone Git ako ti više paše)
+COPY . .
 
-# 4) kopiranje koda
-COPY . /app/plex-yt
-
-# 5) permissions
+# — output direktoriji
 RUN mkdir -p output spotify_output \
- && chmod -R 777 output spotify_output yt.txt
+ && chmod -R 777 output spotify_output \
+ && chmod 777 yt.txt
 
-# 6) dependencies
-RUN pip install --no-cache-dir \
-      requests \
-      "uvicorn[standard]" \
- && pip install --no-cache-dir -r requirements.txt
+# — instaliraj Python deps iz requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 7) expose
+# — izloži port (nije obavezno za Railway, ali dokumentira)
 EXPOSE 7860
 
-# 8) start na portu koji Railway zadaje u env VAR PORT
-CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port $PORT"]
-
-
+# — slušaj na $PORT ili 7860 ako nije definiran
+CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
