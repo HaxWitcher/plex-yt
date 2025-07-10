@@ -1,26 +1,27 @@
 # syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 
-# — instaliraj OS pakete
+# instaliraj OS pakete
 RUN apt-get update \
- && apt-get install -y git ffmpeg \
- && apt-get clean
+ && apt-get install -y --no-install-recommends \
+      ffmpeg git \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# — kopiraj sav kod (ili clone Git ako ti više paše)
-COPY . .
-
-# — output direktoriji
-RUN mkdir -p output spotify_output \
- && chmod -R 777 output spotify_output \
- && chmod 777 yt.txt
-
-# — instaliraj Python deps iz requirements
+# kopiraj dependencies pa instaliraj
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# — izloži port (nije obavezno za Railway, ali dokumentira)
-EXPOSE 7860
+# kopiraj sav kod (main.py, yt.txt, output mape, ...)
+COPY . .
 
-# — slušaj na $PORT ili 7860 ako nije definiran
-CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
+# da container knows to listen on whatever PORT Railway postavi
+ENV PORT  ${PORT:-7860}
+
+# expose bez obzira
+EXPOSE $PORT
+
+# koristi shell form da $PORT zaživi
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
