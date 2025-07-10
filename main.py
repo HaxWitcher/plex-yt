@@ -1,37 +1,192 @@
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Request, Query, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+import yt_dlp
+import os
+import asyncio
+from datetime import datetime
+from urllib.parse import quote
+import logging
+import subprocess
+import base64
+import requests
 
+# --- Spotify credentials ---
+SPOTIFY_CLIENT_ID = "spotify_client_id kalian "
+SPOTIFY_CLIENT_SECRET = "Spotify_client_secret kalian "
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_URL = "https://api.spotify.com/v1"
+
+# --- Logging setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- FastAPI app ---
+app = FastAPI(
+    title="YouTube dan Spotify Downloader API",
+    description="API untuk preuzimanje i stream video/audio s YouTube i Spotify.",
+    version="2.0.2"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Directories and files ---
+OUTPUT_DIR = "output"
+SPOTIFY_OUTPUT_DIR = "spotify_output"
+COOKIES_FILE = "yt.txt"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
+
+# --- Concurrency control ---
+MAX_CONCURRENT_DOWNLOADS = 30
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# --- Helpers ---
+async def delete_file_after_delay(file_path: str, delay: int = 600):
+    await asyncio.sleep(delay)
+    try:
+        os.remove(file_path)
+        logger.info(f"File {file_path} deleted after {delay}s.")
+    except Exception as e:
+        logger.warning(f"Could not delete {file_path}: {e}")
+
+def load_cookies_header() -> str:
+    """
+    Parsira Netscape cookies iz yt.txt i vraća ih kao 'name1=val1; name2=val2; ...'
+    """
+    cookies = []
+    with open(COOKIES_FILE, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) >= 7:
+                name, value = parts[5], parts[6]
+                cookies.append(f"{name}={value}")
+    return '; '.join(cookies)
+
+def get_spotify_access_token():
+    auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    headers = {"Authorization": f"Basic {b64_auth}"}
+    data = {"grant_type": "client_credentials"}
+    resp = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
+    if resp.status_code != 200:
+        raise Exception(f"Token error: {resp.text}")
+    return resp.json()["access_token"]
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = datetime.now()
+    response = await call_next(request)
+    ms = (datetime.now() - start).microseconds / 1000
+    logger.info(f"{request.client.host} {request.method} {request.url} -> {response.status_code} [{ms:.1f}ms]")
+    return response
+
+@app.get("/", summary="Root")
+async def root():
+    index = "/app/Apiytdlp/index.html"
+    return FileResponse(index) if os.path.exists(index) else JSONResponse(status_code=404, content={"error": "index.html not found"})
+
+# --- Download video to file ---
+@app.get("/download/", summary="Preuzmi video")
+async def download_video(background_tasks: BackgroundTasks, url: str = Query(...), resolution: int = Query(720)):
+    await download_semaphore.acquire()
+    try:
+        ydl_opts = {
+            'format': f'bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_%(resolution)sp.%(ext)s'),
+            'cookiefile': COOKIES_FILE,
+            'merge_output_format': 'mp4'
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        background_tasks.add_task(delete_file_after_delay, path)
+        return FileResponse(path, media_type="video/mp4", filename=os.path.basename(path))
+    except Exception as e:
+        logger.error(f"download_video error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
+
+# --- Streaming endpoint (HLS redirect na m3u8 za 1080p) ---
 @app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Učitaj cookies iz tvog yt.txt i složi ih u header
-        cookie_header = load_cookies_header()  # ista funkcija koju već imaš
+        # 1) Učitaj cookieje u header
+        cookie_header = load_cookies_header()
 
-        # 2) Pozovi yt-dlp samo za ekstrakciju info, s tvojim kolačićima
+        # 2) Izvuci sve tokove iz yt-dlp (samo metadata)
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
+            "cookiefile": COOKIES_FILE,
             "http_headers": {"Cookie": cookie_header},
-            # forsiraj hls ako ga ima
             "hls_prefer_native": True,
             "hls_allow_cache": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 3) Pronađi HLS master playlist (m3u8) format
+        # 3) Pronađi HLS (m3u8) tok
         hls_fmt = next(
             f for f in info["formats"]
             if f.get("protocol", "").startswith("m3u8")
         )
 
-        # 4) Vraćamo redirect na tu playlistu — klijent (VLC/browser) sad izravno povlači segmente
+        # 4) Redirect klijentu na .m3u8 URL
         return RedirectResponse(hls_fmt["url"])
 
     except StopIteration:
         raise HTTPException(
             status_code=404,
-            detail=f"Nema HLS (m3u8) tokova za odabranu rezoluciju."
+            detail=f"Nema HLS (m3u8) tokova za {resolution}p."
         )
     except Exception as e:
         logger.error(f"stream_video error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Download audio u mp3 ---
+@app.get("/download/audio/", summary="Preuzmi audio")
+async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...)):
+    await download_semaphore.acquire()
+    try:
+        ydl_opts = {
+            'outtmpl': os.path.join(OUTPUT_DIR, '%(title)s_audio.mp3'),
+            'format': 'bestaudio/best',
+            'cookiefile': COOKIES_FILE,
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
+            'prefer_ffmpeg': True,
+            'quiet': True,
+            'no_warnings': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        fname = f"{info['title']}_audio.mp3"
+        path = os.path.join(OUTPUT_DIR, fname)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        background_tasks.add_task(delete_file_after_delay, path)
+        return FileResponse(path, media_type="audio/mpeg", filename=fname)
+    except Exception as e:
+        logger.error(f"download_audio error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
+
+# --- Serve already downloaded file ---
+@app.get("/download/file/{filename}", summary="Poslužuje fajl")
+async def serve_file(filename: str):
+    path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={"error": "File nije pronađen"})
+    return FileResponse(path, filename=filename)
