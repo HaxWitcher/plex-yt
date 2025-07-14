@@ -157,11 +157,14 @@ async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
         cookie_header = load_cookies_header()
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
 
-        # 5) FRAGMENTED MP4 streaming via FFMPEG
+        # 5) FRAGMENTED MP4 streaming via FFMPEG with stable timestamps
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             *headers_arg, '-i', vid_url,
             *headers_arg, '-i', aud_url,
+            '-fflags', '+genpts',
+            '-reset_timestamps', '1',
+            '-avoid_negative_ts', 'make_zero',
             '-c:v', 'copy', '-c:a', 'copy',
             '-movflags', 'frag_keyframe+empty_moov',
             '-f', 'mp4', 'pipe:1'
