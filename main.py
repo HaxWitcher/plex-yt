@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # --- FastAPI app ---
 app = FastAPI(
     title="YouTube dan Spotify Downloader API",
-    description="API untuk mengunduh atau stream video/audio dari YouTube dan Spotify.",
+    description="API za download i streaming video/audio sa YouTube i Spotify.",
     version="2.0.2"
 )
 app.add_middleware(
@@ -124,19 +124,15 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
         download_semaphore.release()
 
 # --- Streaming endpoint (fragmented MP4 in 1080p) ---
-@app.get("/stream/", summary="Streamuj video odmah bez čekanja čitavog download-a")
+@app.get("/stream/", summary="Streamuj video odmah bez čekanja celog download-a")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats with cookies file
-        ydl_opts = {
-            'quiet': True,
-            'cookiefile': COOKIES_FILE,
-            'no_warnings': True,
-        }
+        # 1) Extract formats uz cookies
+        ydl_opts = {'quiet': True, 'cookiefile': COOKIES_FILE, 'no_warnings': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Find explicit 1080p mp4 video-only
+        # 2) Nađi 1080p mp4 video-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none'
@@ -144,31 +140,30 @@ async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
                and f.get('ext') == 'mp4'
         )
 
-        # 3) Pick highest‐bitrate audio-only track
+        # 3) Najbolja audio-only traka
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        vid_url = vid_fmt['url']
-        aud_url = aud_fmt['url']
-
-        # 4) Build Cookie header
+        vid_url, aud_url = vid_fmt['url'], aud_fmt['url']
         cookie_header = load_cookies_header()
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
 
-        # 5) FRAGMENTED MP4 streaming via FFMPEG with stable timestamps
+        # 4) FFmpeg komanda sa izmenama za stabilne timestamp-ove:
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             *headers_arg, '-i', vid_url,
             *headers_arg, '-i', aud_url,
             '-fflags', '+genpts',
+            '-use_wallclock_as_timestamps', '1',
             '-reset_timestamps', '1',
             '-avoid_negative_ts', 'make_zero',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof+skip_sidx',
             '-c:v', 'copy', '-c:a', 'copy',
-            '-movflags', 'frag_keyframe+empty_moov',
             '-f', 'mp4', 'pipe:1'
         ]
+
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
         return StreamingResponse(proc.stdout, media_type="video/mp4")
 
@@ -206,7 +201,7 @@ async def download_audio(background_tasks: BackgroundTasks, url: str = Query(...
     finally:
         download_semaphore.release()
 
-# --- Serve downloaded file ---
+# --- Serve lokalni fajl ---
 @app.get("/download/file/{filename}", summary="Poslužuje fajl")
 async def serve_file(filename: str):
     path = os.path.join(OUTPUT_DIR, filename)
