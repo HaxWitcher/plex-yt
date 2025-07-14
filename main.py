@@ -5,11 +5,8 @@ import yt_dlp
 import os
 import asyncio
 from datetime import datetime
-from urllib.parse import quote
 import logging
 import subprocess
-import base64
-import requests
 import pathlib
 
 # --- Paths ---
@@ -21,12 +18,6 @@ SPOTIFY_OUTPUT_DIR = str(BASE_DIR / "spotify_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SPOTIFY_OUTPUT_DIR, exist_ok=True)
 
-# --- Spotify credentials ---
-SPOTIFY_CLIENT_ID = "spotify_client_id kalian"
-SPOTIFY_CLIENT_SECRET = "spotify_client_secret kalian"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_API_URL = "https://api.spotify.com/v1"
-
 # --- Concurrency control ---
 MAX_CONCURRENT_DOWNLOADS = 30
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -36,8 +27,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="YouTube dan Spotify Downloader API",
-    description="API untuk download i stream video/audio",
+    title="YouTube i Spotify Downloader API",
+    description="API za download i streaming video/audio sa YouTube i Spotify",
     version="2.0.3"
 )
 app.add_middleware(
@@ -52,7 +43,7 @@ async def delete_file_after_delay(file_path: str, delay: int = 600):
     await asyncio.sleep(delay)
     try:
         os.remove(file_path)
-        logger.info(f"File {file_path} deleted after {delay}s.")
+        logger.info(f"File {file_path} obrisan nakon {delay}s.")
     except Exception:
         pass
 
@@ -67,21 +58,23 @@ def load_cookies_header() -> str:
                 cookies.append(f"{parts[5]}={parts[6]}")
     return '; '.join(cookies)
 
-@app.get("/stream/", summary="Streamuj video odmah")
+@app.get("/stream/", summary="Streamuj video odmah bez čekanja")
 async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Povuci info sa yt-dlp (koristeći cookiefile)
+        # 1) Uzmi info iz yt-dlp
         ydl_opts = {'quiet': True, 'cookiefile': COOKIES_FILE, 'no_warnings': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Nađi tačno 1080p video-only
-        vid_fmt = next(f for f in info['formats']
-                       if f.get('vcodec') != 'none'
-                       and f.get('height') == resolution
-                       and f.get('ext') == 'mp4')
+        # 2) Pronađi 1080p video-only tok
+        vid_fmt = next(
+            f for f in info['formats']
+            if f.get('vcodec') != 'none'
+               and f.get('height') == resolution
+               and f.get('ext') == 'mp4'
+        )
 
-        # 3) Izaberi audio visokog bitrate-a
+        # 3) Pronađi najbolji audio-only tok
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
@@ -89,25 +82,27 @@ async def stream_video(url: str = Query(...), resolution: int = Query(1080)):
 
         vid_url = vid_fmt['url']
         aud_url = aud_fmt['url']
+
+        # 4) Sastavi cookie header za FFMPEG
         cookie_header = load_cookies_header()
         headers_arg = ['-headers', f"Cookie: {cookie_header}\r\n"]
 
-        # 4) FFMPEG: fragmentirani MP4 sa generisanim PTS i resetovanim timestamp-ima
+        # 5) Pozovi ffmpeg za fragmentirani MP4 sa genpts/reset_timestamps
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
-            '-fflags', '+genpts',
-            '-reset_timestamps', '1',
+            '-fflags', '+genpts',            # generiši PTS
+            '-reset_timestamps', '1',        # resetuj ts u svakom fragmentu
             *headers_arg, '-i', vid_url,
             *headers_arg, '-i', aud_url,
             '-c:v', 'copy', '-c:a', 'copy',
-            '-movflags', 'frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset',
+            '-movflags', 'frag_keyframe+empty_moov',
             '-f', 'mp4', 'pipe:1'
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**6)
         return StreamingResponse(proc.stdout, media_type="video/mp4")
 
     except StopIteration:
-        raise HTTPException(status_code=404, detail=f"Nema {resolution}p toka.")
+        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
     except Exception as e:
         logger.error(f"stream_video error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
